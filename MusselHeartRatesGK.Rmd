@@ -1,0 +1,109 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+This file takes raw IR data and caclulates average heart rate every 60 seconds. For periods where the sample period for all 8 sensors is greater than 99ms, that sample is ignored. Currently, when a sample period of greater than 99ms is found, that entire minute of data is ignored and an NA is written to the heart rate file. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(pracma) #for findpeaks
+library(lubridate) #for working with date/time
+musselheart<-read.csv(file.choose()) #tested with 20200910_0000_00_SN04_IR
+```
+
+Data wrangling
+```{r}
+#create new column with sample period
+musselheart<-mutate(musselheart, sampleperiod = endMillis - startMillis)
+#creates separate frame of all the gaps in sampling where a full sample took more than 99ms. Not exactly useful but good to know how many gaps there were in one day and when they occur
+musselheartgaps<-subset(musselheart, sampleperiod>99)
+#subset of data without the long sampling periods, also not exactly useful 
+musselheartfast<-subset(musselheart, sampleperiod<100)
+```
+
+Loop to calculate heart rate for a full day on one sensor. The arguments of findpeaks() in row 55 are likely sensor-specific so testing code towards the end of the file will be useful when calculating heart rate of other sensors
+```{r}
+#Object creation prior to running loop. reset r, t, and heartrates6 between runs
+
+#r takes the first row of DateTime as our initial time value
+r=as.POSIXct(spyvalve$DateTime[1])
+#t is the end of whatever minute r is, these are the book ends of the minute of data we'll look at
+t=r+seconds(59)
+#update DateTime from class factor to POSIXct so that we can use relational operators in our loop
+musselheart$DateTime = as.POSIXct(musselheart$DateTime)
+#create column names for the heartrates6 data frame
+l <- c('UnixTime','SN04S6_bpm')
+#create the heartrates6 data frame. For some reason the column names get overwritten if nrow = 0, so it makes row 1 with NAs
+heartrates6 <- as.data.frame(matrix(ncol = length(l), nrow=1, dimnames = list(NULL,l)))
+
+for (i in 1:(nrow(musselheart)/600)) {
+  #create a subset of one minute of data 
+  musselheart_sub = filter(musselheart, DateTime <= t & DateTime >= r)
+  for (j in 1:nrow(musselheart_sub)) {
+  #create a vector that saves a 1 for rows where sampleperiod < 99 is true and     saves a 0 when false  
+  samplelengths<-as.numeric(musselheart_sub$sampleperiod < 99)
+  #sums the sample lengths as a single value, to be used in the if statement
+  sum_samplelengths <- sum(samplelengths)
+    #if sum_samplelengths is 600, then all of our rows have sampleperiod < 99 and     we can calculate HR for this minute
+    if(sum_samplelengths == 600) {
+    #create vector of IR only
+    s6sub<-musselheart_sub$Sensor6IR
+    #find peaks in the newly created vector
+    beats1<-as.data.frame(findpeaks(-s6sub, nups = 1, ndowns = 2, minpeakdistance     = 17,  sortstr = F)) 
+    #sort beats1 in order of indices
+    beats1<-beats1[order(beats1$V2),]
+    #calculate average bpm for the chunk
+    y<-mean(60/(diff(beats1$V2)/10)) 
+    #add UnixTime value and the average bpm value to newrow1
+    newrow1<-c(musselheart_sub[1,]$UnixTime, y)
+    #write newrow1 to the heartrates6 data frame
+    heartrates6<-rbind(heartrates6,newrow1)  
+    #reset y and increment time variables for next iteration
+    y = 0
+    r = r+minutes(1) 
+    t = t+minutes(1)
+     } else {
+       #if the sample period at any point within that minute (r to t) is greater        than 99ms,write an NA to the data frame and increment to the next minute 
+       newrow<-c(musselheart_sub[1,]$UnixTime, NA)
+       heartrates6<-rbind(heartrates6, newrow)
+       r = r+minutes(1) 
+       t = t+minutes(1)
+     }
+  break
+  }
+}
+#this loop works, but it doesn't stop executing when i gets to nrow(musselheart)/600 and it doesn't stop at all until terminated. This makes heartrates6 a data frame with all the heart rate data, and a bunch of NA rows following it until the loop is terminated. 
+```
+
+Code chunks that follow are earlier ideas and/or options for testing and verification
+
+Initial plotting
+```{r}
+#plotting 600 data points = 60 seconds of heart beats. Plot each sensor and see which have clear signals
+ggplot()+
+  geom_line(data = musselheartfast[1:600,], aes(x = startMillis, y = Sensor6IR),       color = "blue")+
+  ggtitle("30 Seconds of  Heart Beats")+
+  theme_classic()
+```
+
+Detect valleys using findpeaks() and verify accuracy by plotting
+```{r}
+#create vector of IR only for the desired sensor
+s8sub<-musselheartfast$Sensor8IR[1:300]
+#find valleys in the newly created vector: the arguments of this function can be adjusted to match the signal of each sensor
+beats<-as.data.frame(findpeaks(-s8sub, nups = 1, ndowns = 2, minpeakdistance = 10,  sortstr = F))
+#plots IR vector and the index values from beats as points. Tweak findpeaks() arguments if needed
+plot(s8sub, type = 'l')
+points(beats[, 2], s8sub[beats[, 2]], col = "red")
+```
+
+Creating the csv with multiple sensors
+```{r}
+
+#combine all sensors from the same day into one data frame, do this by making a separate heartrates df for each sensor and then left join them together by UnixTime
+SN03_heartrates<-left_join(SN03_heartrates, heartrates, by = "UnixTime")
+#save new dataframe as csv
+write.csv(SN03_heartrates,"/Users/gabbyk/Downloads/SN03_heartrates.csv", row.names = FALSE)
