@@ -11,7 +11,16 @@ library(dplyr)
 library(ggplot2)
 library(pracma) #for findpeaks
 library(lubridate) #for working with date/time
-musselheart<-read.csv(file.choose()) #tested with 20200910_0000_00_SN04_IR
+fname = file.choose() # store the filename for use
+musselheart<-read.csv(fname) #tested with 20200910_0000_00_SN04_IR
+# extract serial number from file name
+bname = basename(fname)
+SN = substr(bname,start = 18, stop = 21) # SNxx is in positions 18-21 in the file names
+```
+
+```{r sampleRate}
+Fs = 10 # Sampling frequency Fs (samples per second)
+samplesPerMinute = Fs * 60 # Number of samples in a complete minute (10Hz * 60 sec = 600 samples)
 ```
 
 Data wrangling
@@ -29,11 +38,20 @@ Loop to calculate heart rate for a full day on one sensor. The arguments of find
 #Object creation prior to running loop. reset r, t, and heartrates6 between runs
 
 #r takes the first row of DateTime as our initial time value
-r=as.POSIXct(spyvalve$DateTime[1])
+#r=as.POSIXct(spyvalve$DateTime[1]) # No spyvalve dataset yet?
+
+# typical Time zone options: etc/GMT+9 is alaska standard time, UTC is greenwich mean 
+# time, etc/GMT+8 is alaska daylight time (and Pacific standard time)
+r=as.POSIXct(musselheart$DateTime[1], tz = 'etc/GMT+9')
 #t is the end of whatever minute r is, these are the book ends of the minute of data we'll look at
-t=r+seconds(59)
+# LPM: POSIXct values are stored internally as number of seconds since 1970-1-1 (i.e. unixtime)
+# so you can just add 59 to r and you'll have a time 59 seconds in the future
+#t=r+seconds(59)
+t=r+59
 #update DateTime from class factor to POSIXct so that we can use relational operators in our loop
-musselheart$DateTime = as.POSIXct(musselheart$DateTime)
+# typical Time zone options: etc/GMT+9 is alaska standard time, UTC is greenwich mean 
+# time, etc/GMT+8 is alaska daylight time (and Pacific standard time)
+musselheart$DateTime = as.POSIXct(musselheart$DateTime, tz = 'etc/GMT+9')
 #create column names for the heartrates6 data frame
 l <- c('UnixTime','SN04S6_bpm')
 #create the heartrates6 data frame. For some reason the column names get overwritten if nrow = 0, so it makes row 1 with NAs
@@ -42,6 +60,7 @@ heartrates6 <- as.data.frame(matrix(ncol = length(l), nrow=1, dimnames = list(NU
 for (i in 1:(nrow(musselheart)/600)) {
   #create a subset of one minute of data 
   musselheart_sub = filter(musselheart, DateTime <= t & DateTime >= r)
+  musselheart_sub = musselheart[musselheart$DateTime >= r & musselheart$DateTime<=t,]
   for (j in 1:nrow(musselheart_sub)) {
   #create a vector that saves a 1 for rows where sampleperiod < 99 is true and     saves a 0 when false  
   samplelengths<-as.numeric(musselheart_sub$sampleperiod < 99)
@@ -52,7 +71,7 @@ for (i in 1:(nrow(musselheart)/600)) {
     #create vector of IR only
     s6sub<-musselheart_sub$Sensor6IR
     #find peaks in the newly created vector
-    beats1<-as.data.frame(findpeaks(-s6sub, nups = 1, ndowns = 2, minpeakdistance     = 17,  sortstr = F)) 
+    beats1<-as.data.frame(findpeaks(-s6sub, nups = 1, ndowns = 2, minpeakdistance = 17,  sortstr = F)) 
     #sort beats1 in order of indices
     beats1<-beats1[order(beats1$V2),]
     #calculate average bpm for the chunk
@@ -77,6 +96,75 @@ for (i in 1:(nrow(musselheart)/600)) {
 }
 #this loop works, but it doesn't stop executing when i gets to nrow(musselheart)/600 and it doesn't stop at all until terminated. This makes heartrates6 a data frame with all the heart rate data, and a bunch of NA rows following it until the loop is terminated. 
 ```
+
+
+```{r alternateLoopVersion}
+# Data are in musselheart, complete with gaps
+
+# Declare which sensor column you want to use. The exact location of the sensor's column
+# may shift day to day, so it's safest to address it directly by this name rather than
+# a column number
+sensorName = 'Sensor6IR'
+
+# Convert the values in DateTime column to POSIXct
+# Typical Time zone options: etc/GMT+9 is alaska standard time, UTC is greenwich mean 
+# time, etc/GMT+8 is alaska daylight time (and Pacific standard time)
+musselheart$DateTime = as.POSIXct(musselheart$DateTime, tz = 'etc/GMT+9')
+
+# Get the time value of the first minute of the data set
+t1 = musselheart$DateTime[1]
+t1 = as.POSIXlt(t1)
+t1$sec = 0 # Set the seconds value to zero if it's not already
+t1 = as.POSIXct(t1) # convert back to POSIXct
+
+# Generate a vector of 1-minute intervals from the start to end time values for this
+# data set
+timevals = seq.POSIXt(from = t1, 
+                      to = musselheart$DateTime[nrow(musselheart)], by = 'min' )
+# Make an output dataframe consisting of the time values (1 minute intervals) and 
+# column(s) of NAs for the sensor channel(s)
+heartrates = data.frame(DateTime = timevals, Sensor = NA)
+# Rename the columns.  NOTE: if time stamps are in Alaska standard time, note that here in the
+# DateTime column name. If they're in some other time zone (AK daylight savings for example),
+# change the column name to reflect that (or shift the timezone of the timestamps to match
+# AK standard time, since it's probably the most intuitive time zone to work in with the enviro data)
+# Also paste together a sensor column name using the file's serial number info and the sensor's
+# column name
+sensorColname = paste0(SN,sensorName)
+colnames(heartrates) = c('DateTimeAST', sensorColname)
+
+for (i in 1:nrow(heartrates)){
+  # See how many rows fall within the time[i] to time[i]+60 range. Ideally this 
+  # should be 10Hz * 60 seconds = 600 = samplesPerMinute variable 
+  minuteLength = length(musselheart$DateTime[ (musselheart$DateTime >= heartrates$DateTime[i]) & 
+                        (musselheart$DateTime < (heartrates$DateTime[i]+60) )  ])
+  if (minuteLength == samplesPerMinute) {
+    # Good minute's worth of data, do the peak finding
+    #create vector of IR only
+    sensor_sub = musselheart[(musselheart$DateTime >= heartrates$DateTime[i]) & 
+                    (musselheart$DateTime < (heartrates$DateTime[i]+60) ), 
+                    sensorName]
+    #find peaks in the newly created vector
+    beats1<-as.data.frame(findpeaks(-sensor_sub, nups = 1, ndowns = 2, 
+                                    minpeakdistance = 17,  sortstr = F))
+    #sort beats1 in order of indices
+    beats1<-beats1[order(beats1$V2),]
+    #calculate average bpm for the chunk
+    bpm<-mean(60/(diff(beats1$V2)/10))
+    bpm = round(bpm, 1)  # round off result to 1 decimal place
+    # Write result to output data frame
+    heartrates[i, sensorColname] = bpm
+    
+  } else if (minuteLength < samplesPerMinute){
+    # Can't use this minute's data, advance to next minute
+    # Leave the NA in the output data frame for this row
+  }
+}  # end of for loop
+
+
+
+```
+
 
 Code chunks that follow are earlier ideas and/or options for testing and verification
 
